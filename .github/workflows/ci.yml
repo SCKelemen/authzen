@@ -1,0 +1,150 @@
+name: CI
+
+# Build, vet, format-check, and test BOTH Go modules in this repository:
+#   - the zero-dependency root module  github.com/SCKelemen/authzen
+#   - the nested gRPC module           github.com/SCKelemen/authzen/grpc
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Root module: github.com/SCKelemen/authzen (core + client/ + server/).
+  # This is the format/vet gate AND the build/test gate for the root module.
+  # ---------------------------------------------------------------------------
+  root:
+    name: root module (build, vet, test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Prefer go-version-file: setup-go reads the `go 1.26` directive from
+          # go.mod and resolves the matching toolchain. If go 1.26 is not yet
+          # available on GitHub-hosted runners, replace the next line with:
+          #   go-version: 'stable'
+          # ('stable' always resolves; Go's GOTOOLCHAIN=auto will still fetch
+          # the go.mod-required 1.26 toolchain on demand for build/test).
+          go-version-file: go.mod
+          # Root module has zero external dependencies (no go.sum), so key the
+          # build cache off go.mod.
+          cache-dependency-path: go.mod
+
+      - name: gofmt (fail on unformatted files)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: all files formatted"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test (race + coverage)
+        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-root
+          path: coverage.out
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Nested gRPC module: github.com/SCKelemen/authzen/grpc.
+  # Verifies the committed generated *.pb.go is up to date, then builds/tests.
+  # ---------------------------------------------------------------------------
+  grpc:
+    name: grpc module (buf, build, vet, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: grpc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # See the note in the `root` job about go 1.26 vs. 'stable'.
+          go-version-file: grpc/go.mod
+          cache-dependency-path: grpc/go.sum
+
+      - name: Set up buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc-gen-go plugins
+        # buf-setup-action installs buf only; buf generate needs the Go plugins
+        # on PATH. Versions are pinned to the ones that produced the committed
+        # stubs so `git diff --exit-code` below is deterministic.
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: gofmt (fail on unformatted files)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: all files formatted"
+
+      - name: buf lint
+        run: buf lint
+
+      - name: buf generate (verify committed stubs are up to date)
+        run: buf generate
+
+      - name: Ensure generated code is committed
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Generated code is out of date. Run 'make generate' in grpc/ and commit the result."
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test (race + coverage)
+        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-grpc
+          path: grpc/coverage.out
+          if-no-files-found: error
