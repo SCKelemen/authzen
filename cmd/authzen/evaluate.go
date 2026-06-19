@@ -72,9 +72,8 @@ func runEvaluate(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
-	if g.url == "" {
-		fmt.Fprintln(stderr, "authzen evaluate: --url is required")
-		return 2
+	if code, ok := validateGlobal("evaluate", g, stderr); !ok {
+		return code
 	}
 
 	req, code := buildEvaluationRequest(requestPath, stdin, stderr,

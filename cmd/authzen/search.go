@@ -106,9 +106,8 @@ func runSearchKind(kind string, args []string, stdin io.Reader, stdout, stderr i
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
-	if g.url == "" {
-		fmt.Fprintf(stderr, "authzen search %s: --url is required\n", kind)
-		return 2
+	if code, ok := validateGlobal("search "+kind, g, stderr); !ok {
+		return code
 	}
 
 	var ctxObj authzen.Context

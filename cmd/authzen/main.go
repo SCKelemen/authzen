@@ -32,7 +32,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/SCKelemen/authzen/client"
@@ -87,10 +89,11 @@ Commands:
 Run "authzen <command> --help" for command-specific flags.
 
 Common flags (accepted by every command):
-  --url string        PDP base URL, e.g. https://pdp.example.com (required)
-  --token string      OAuth 2.0 bearer token sent in the Authorization header
-  --timeout duration  Per-request timeout (default 30s)
-  --json              Print the raw JSON response instead of a summary
+  --url string          PDP base URL, e.g. https://pdp.example.com (required)
+  --token string        OAuth 2.0 bearer token sent in the Authorization header
+  --timeout duration    Per-request timeout, must be > 0 (default 30s)
+  --insecure-allow-http Permit sending --token to an http:// URL (unsafe)
+  --json                Print the raw JSON response instead of a summary
 
 Exit codes:
   0  successful API call (a deny decision is still a success)
@@ -104,21 +107,51 @@ Spec: https://openid.net/specs/authorization-api-1_0.html
 
 // globalOpts holds the flags shared by every subcommand.
 type globalOpts struct {
-	url     string
-	token   string
-	timeout time.Duration
-	json    bool
+	url               string
+	token             string
+	timeout           time.Duration
+	json              bool
+	insecureAllowHTTP bool
 }
 
-// registerGlobal registers the shared --url/--token/--timeout/--json flags on
-// fs and returns the destination struct.
+// registerGlobal registers the shared flags on fs and returns the destination
+// struct.
 func registerGlobal(fs *flag.FlagSet) *globalOpts {
 	o := &globalOpts{}
 	fs.StringVar(&o.url, "url", "", "PDP base URL, e.g. https://pdp.example.com (required)")
 	fs.StringVar(&o.token, "token", "", "OAuth 2.0 bearer token for the Authorization header")
-	fs.DurationVar(&o.timeout, "timeout", 30*time.Second, "per-request timeout")
+	fs.DurationVar(&o.timeout, "timeout", 30*time.Second, "per-request timeout (must be > 0)")
 	fs.BoolVar(&o.json, "json", false, "print the raw JSON response instead of a summary")
+	fs.BoolVar(&o.insecureAllowHTTP, "insecure-allow-http", false, "permit sending --token to an http:// URL (unsafe; the token is sent in cleartext)")
 	return o
+}
+
+// validateGlobal checks the shared options that every subcommand requires,
+// writing a diagnostic to stderr and returning (2, false) on a usage error. The
+// cmd label (for example "evaluate" or "search subject") prefixes the message.
+//
+// It enforces three rules:
+//   - --url is required;
+//   - --timeout must be > 0 (a zero/negative deadline would let a stuck PDP
+//     hang the command forever);
+//   - a --token must not be sent to a non-https URL unless --insecure-allow-http
+//     is given, so a bearer credential is not leaked in cleartext (Section 11.1).
+func validateGlobal(cmd string, g *globalOpts, stderr io.Writer) (int, bool) {
+	if g.url == "" {
+		fmt.Fprintf(stderr, "authzen %s: --url is required\n", cmd)
+		return 2, false
+	}
+	if g.timeout <= 0 {
+		fmt.Fprintf(stderr, "authzen %s: --timeout must be greater than zero\n", cmd)
+		return 2, false
+	}
+	if g.token != "" && !g.insecureAllowHTTP {
+		if u, err := url.Parse(g.url); err == nil && u.Scheme != "" && !strings.EqualFold(u.Scheme, "https") {
+			fmt.Fprintf(stderr, "authzen %s: refusing to send --token over %s:// (use --insecure-allow-http to override)\n", cmd, u.Scheme)
+			return 2, false
+		}
+	}
+	return 0, true
 }
 
 // newClient builds a PEP client from the shared options.
@@ -130,14 +163,18 @@ func newClient(g *globalOpts) *client.Client {
 	if g.token != "" {
 		opts = append(opts, client.WithBearerToken(g.token))
 	}
+	if g.insecureAllowHTTP {
+		opts = append(opts, client.WithInsecureAllowHTTP())
+	}
 	return client.New(g.url, opts...)
 }
 
-// withTimeout derives a context honoring the configured --timeout. A zero or
-// negative timeout means no deadline.
+// withTimeout derives a context honoring the configured --timeout. The timeout
+// is validated to be > 0 by validateGlobal, so the deadline is always finite.
 func withTimeout(g *globalOpts) (context.Context, context.CancelFunc) {
 	if g.timeout <= 0 {
-		return context.WithCancel(context.Background())
+		// Defensive: validateGlobal rejects this, but never run unbounded.
+		return context.WithTimeout(context.Background(), 30*time.Second)
 	}
 	return context.WithTimeout(context.Background(), g.timeout)
 }

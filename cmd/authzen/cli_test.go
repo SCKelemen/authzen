@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -922,13 +923,75 @@ func TestSubcommandHelp(t *testing.T) {
 	}
 }
 
-// TestZeroTimeout verifies that --timeout 0 (no deadline) still works.
-func TestZeroTimeout(t *testing.T) {
+// TestZeroTimeoutRejected verifies that --timeout 0 is rejected as a usage error
+// (exit 2): an infinite deadline could let a stuck PDP hang the command forever.
+func TestZeroTimeoutRejected(t *testing.T) {
+	code, stdout, stderr := invoke([]string{
+		"evaluate", "--url", "https://pdp.example.com", "--timeout", "0",
+		"--subject-type", "user", "--subject-id", "alice@example.com",
+		"--action", "can_read", "--resource-type", "todo", "--resource-id", "1",
+	}, "")
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stderr: %s)", code, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "--timeout must be greater than zero") {
+		t.Fatalf("stderr = %q, want timeout message", stderr)
+	}
+}
+
+// TestNegativeTimeoutRejected verifies a negative --timeout is also rejected.
+func TestNegativeTimeoutRejected(t *testing.T) {
+	code, _, stderr := invoke([]string{
+		"discover", "--url", "https://pdp.example.com", "--timeout", "-5s",
+	}, "")
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "--timeout must be greater than zero") {
+		t.Fatalf("stderr = %q, want timeout message", stderr)
+	}
+}
+
+// TestTokenRefusedOverHTTP verifies the P0 fix at the CLI: a --token may not be
+// sent to a non-https URL by default. The command refuses with a usage error
+// (exit 2) before any request, so the credential never reaches the wire.
+func TestTokenRefusedOverHTTP(t *testing.T) {
 	srv, closeFn := newPDP(t, stubPDP{})
-	defer closeFn()
+	defer closeFn() // srv.URL is loopback http
 
 	code, stdout, stderr := invoke([]string{
-		"evaluate", "--url", srv.URL, "--timeout", "0",
+		"evaluate", "--url", srv.URL, "--token", "secret-token",
+		"--subject-type", "user", "--subject-id", "alice@example.com",
+		"--action", "can_read", "--resource-type", "todo", "--resource-id", "1",
+	}, "")
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stderr: %s)", code, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "refusing to send --token over http://") {
+		t.Fatalf("stderr = %q, want http+token refusal", stderr)
+	}
+}
+
+// TestTokenForwardedWithInsecureFlag verifies the opt-out: with
+// --insecure-allow-http the command proceeds over http and the bearer token is
+// forwarded to the PDP in the Authorization header (Section 11.2).
+func TestTokenForwardedWithInsecureFlag(t *testing.T) {
+	var gotAuth string
+	base := server.NewHandler(stubPDP{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		base.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	code, stdout, stderr := invoke([]string{
+		"evaluate", "--url", srv.URL, "--token", "secret-token", "--insecure-allow-http",
 		"--subject-type", "user", "--subject-id", "alice@example.com",
 		"--action", "can_read", "--resource-type", "todo", "--resource-id", "1",
 	}, "")
@@ -938,21 +1001,28 @@ func TestZeroTimeout(t *testing.T) {
 	if got := strings.TrimSpace(stdout); got != "allow" {
 		t.Fatalf("stdout = %q, want allow", got)
 	}
+	if gotAuth != "Bearer secret-token" {
+		t.Fatalf("Authorization = %q, want Bearer secret-token", gotAuth)
+	}
 }
 
-// TestTokenForwarded verifies that --token is accepted and the call succeeds; a
-// bearer token is RECOMMENDED by the spec (Section 11.2).
-func TestTokenForwarded(t *testing.T) {
-	srv, closeFn := newPDP(t, stubPDP{})
-	defer closeFn()
-
+// TestTokenOverHTTPSAllowed verifies that a --token paired with an https URL is
+// accepted without the opt-out flag (the secure, recommended configuration).
+// The request itself fails to connect (no server at that address), but the
+// usage validation must pass, i.e. the exit code is the transport error 1, not
+// the usage error 2.
+func TestTokenOverHTTPSAllowed(t *testing.T) {
 	code, _, stderr := invoke([]string{
-		"evaluate", "--url", srv.URL, "--token", "secret-token",
+		"evaluate", "--url", "https://127.0.0.1:1", "--token", "secret-token",
+		"--timeout", "1s",
 		"--subject-type", "user", "--subject-id", "alice@example.com",
 		"--action", "can_read", "--resource-type", "todo", "--resource-id", "1",
 	}, "")
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 transport error (stderr: %s)", code, stderr)
+	}
+	if strings.Contains(stderr, "refusing to send --token") {
+		t.Fatalf("https+token must not be refused: %s", stderr)
 	}
 }
 
