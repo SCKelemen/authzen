@@ -38,10 +38,20 @@ func (c *Client) Raw() authzenv1.AccessServiceClient {
 }
 
 // Evaluate requests a single access decision (Section 6).
+//
+// The request is validated locally first so a missing required attribute is
+// reported as codes.InvalidArgument (the gRPC analogue of the spec's mandatory
+// HTTP 400) rather than being shipped to the PDP. A failure converting the core
+// request to its proto form is an internal client fault and is reported as
+// codes.Internal via pdpError, never as the bare codes.Unknown that an
+// unwrapped error would surface as.
 func (c *Client) Evaluate(ctx context.Context, req authzen.EvaluationRequest, opts ...grpc.CallOption) (authzen.EvaluationResponse, error) {
+	if err := req.Validate(); err != nil {
+		return authzen.EvaluationResponse{}, invalidArgument(err)
+	}
 	in, err := evaluationRequestToProto(req)
 	if err != nil {
-		return authzen.EvaluationResponse{}, err
+		return authzen.EvaluationResponse{}, pdpError(err)
 	}
 	out, err := c.grpc.Evaluate(ctx, in, opts...)
 	if err != nil {
@@ -51,10 +61,19 @@ func (c *Client) Evaluate(ctx context.Context, req authzen.EvaluationRequest, op
 }
 
 // EvaluateBatch requests a batch of decisions (Section 7).
+//
+// Validation happens on the core request before the proto round-trip. This
+// matters because semanticToProto is lossy: an invalid options.evaluations_
+// semantic has no proto enum and would otherwise be silently collapsed to
+// UNSPECIFIED (execute_all) on the wire. Validating first rejects the bad value
+// as codes.InvalidArgument instead of silently changing the caller's request.
 func (c *Client) EvaluateBatch(ctx context.Context, req authzen.EvaluationsRequest, opts ...grpc.CallOption) (authzen.EvaluationsResponse, error) {
+	if err := req.Validate(); err != nil {
+		return authzen.EvaluationsResponse{}, invalidArgument(err)
+	}
 	in, err := evaluationsRequestToProto(req)
 	if err != nil {
-		return authzen.EvaluationsResponse{}, err
+		return authzen.EvaluationsResponse{}, pdpError(err)
 	}
 	out, err := c.grpc.EvaluateBatch(ctx, in, opts...)
 	if err != nil {
@@ -65,9 +84,12 @@ func (c *Client) EvaluateBatch(ctx context.Context, req authzen.EvaluationsReque
 
 // SearchSubjects lists the subjects authorized for the query (Section 8.4).
 func (c *Client) SearchSubjects(ctx context.Context, req authzen.SubjectSearchRequest, opts ...grpc.CallOption) (authzen.SubjectSearchResponse, error) {
+	if err := req.Validate(); err != nil {
+		return authzen.SubjectSearchResponse{}, invalidArgument(err)
+	}
 	in, err := subjectSearchRequestToProto(req)
 	if err != nil {
-		return authzen.SubjectSearchResponse{}, err
+		return authzen.SubjectSearchResponse{}, pdpError(err)
 	}
 	out, err := c.grpc.SearchSubjects(ctx, in, opts...)
 	if err != nil {
@@ -78,9 +100,12 @@ func (c *Client) SearchSubjects(ctx context.Context, req authzen.SubjectSearchRe
 
 // SearchResources lists the resources authorized for the query (Section 8.5).
 func (c *Client) SearchResources(ctx context.Context, req authzen.ResourceSearchRequest, opts ...grpc.CallOption) (authzen.ResourceSearchResponse, error) {
+	if err := req.Validate(); err != nil {
+		return authzen.ResourceSearchResponse{}, invalidArgument(err)
+	}
 	in, err := resourceSearchRequestToProto(req)
 	if err != nil {
-		return authzen.ResourceSearchResponse{}, err
+		return authzen.ResourceSearchResponse{}, pdpError(err)
 	}
 	out, err := c.grpc.SearchResources(ctx, in, opts...)
 	if err != nil {
@@ -91,9 +116,12 @@ func (c *Client) SearchResources(ctx context.Context, req authzen.ResourceSearch
 
 // SearchActions lists the actions authorized for the query (Section 8.6).
 func (c *Client) SearchActions(ctx context.Context, req authzen.ActionSearchRequest, opts ...grpc.CallOption) (authzen.ActionSearchResponse, error) {
+	if err := req.Validate(); err != nil {
+		return authzen.ActionSearchResponse{}, invalidArgument(err)
+	}
 	in, err := actionSearchRequestToProto(req)
 	if err != nil {
-		return authzen.ActionSearchResponse{}, err
+		return authzen.ActionSearchResponse{}, pdpError(err)
 	}
 	out, err := c.grpc.SearchActions(ctx, in, opts...)
 	if err != nil {

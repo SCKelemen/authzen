@@ -1,6 +1,9 @@
 package authzengrpc
 
 import (
+	"encoding/json"
+	"math"
+
 	authzen "github.com/SCKelemen/authzen"
 	authzenv1 "github.com/SCKelemen/authzen/grpc/gen/authzen/v1"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -34,11 +37,89 @@ func structToMap(s *structpb.Struct) map[string]any {
 // mapToStruct converts a map[string]any into a google.protobuf.Struct. An empty
 // or nil map yields a nil Struct so that an absent object is not serialized as
 // an empty object (mirroring the omitempty behavior of the core JSON tags).
+//
+// structpb.NewStruct only accepts the narrow set of Go types that map directly
+// onto JSON (nil, bool, the numeric kinds, string, []any, and map[string]any).
+// Ordinary Go values that the HTTP/JSON binding handles transparently --
+// slices such as []string (for example a subject's group memberships),
+// map[string]string, and arbitrary structs including the library's own
+// EvaluationError -- are rejected outright, which made any such property or
+// context value fail over gRPC while succeeding over HTTP. To keep the two
+// bindings at parity we JSON-normalize every value first (round-tripping it
+// through encoding/json into the map[string]any / []any / scalar shapes that
+// structpb accepts), exactly mirroring how the core types serialize on the
+// wire over HTTP.
 func mapToStruct(m map[string]any) (*structpb.Struct, error) {
 	if len(m) == 0 {
 		return nil, nil
 	}
-	return structpb.NewStruct(m)
+	normalized, err := normalizeMap(m)
+	if err != nil {
+		return nil, err
+	}
+	return structpb.NewStruct(normalized)
+}
+
+// normalizeMap returns a copy of m in which every value has been JSON-normalized
+// by normalizeValue so that structpb.NewStruct can accept it.
+func normalizeMap(m map[string]any) (map[string]any, error) {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		nv, err := normalizeValue(v)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = nv
+	}
+	return out, nil
+}
+
+// normalizeValue coerces an arbitrary Go value into the JSON-shaped form
+// (map[string]any, []any, or a scalar) that google.protobuf.Struct understands,
+// matching the value the HTTP/JSON binding would put on the wire.
+//
+// EvaluationError is special-cased to its documented JSON object (Section 7.2.1)
+// so the common case of a PDP placing one in a decision context is cheap and
+// explicit; every other value falls through to a generic encoding/json
+// round-trip, which both performs the normalization and surfaces an error for
+// any value that is not JSON-encodable (for example a channel or func).
+func normalizeValue(v any) (any, error) {
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case authzen.EvaluationError:
+		return map[string]any{"status": float64(t.Status), "message": t.Message}, nil
+	case *authzen.EvaluationError:
+		if t == nil {
+			return nil, nil
+		}
+		return map[string]any{"status": float64(t.Status), "message": t.Message}, nil
+	default:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		var out any
+		if err := json.Unmarshal(data, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+}
+
+// clampInt32 narrows a Go int to an int32 for a proto field, saturating at the
+// int32 bounds instead of silently truncating (wrapping) on overflow. The
+// page-related counts it guards (limit, count, total) are non-negative in the
+// spec, but clamping both ends keeps the helper total and safe on any platform
+// where int is 64 bits.
+func clampInt32(n int) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if n < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(n)
 }
 
 // --- Entities (Section 5) ---
@@ -310,7 +391,27 @@ func evaluationsRequestFromProto(r *authzenv1.EvaluateBatchRequest) authzen.Eval
 
 // evaluationsResponseToProto converts a core EvaluationsResponse (Section 7.2)
 // to its proto EvaluateBatchResponse form.
+//
+// The core type carries two response shapes (Section 7.1 backwards
+// compatibility): a batch shape (the evaluations slice) and the single-decision
+// shape of Section 6.2 (a non-nil Decision, used when the originating request
+// omitted the evaluations array, for example via SingleDecision). The proto
+// batch response has only a repeated evaluations field, so a single-decision
+// response is carried as a one-element evaluations array rather than being
+// silently dropped.
 func evaluationsResponseToProto(r authzen.EvaluationsResponse) (*authzenv1.EvaluateBatchResponse, error) {
+	if r.Decision != nil && len(r.Evaluations) == 0 {
+		single, err := evaluationResponseToProto(authzen.EvaluationResponse{
+			Decision: *r.Decision,
+			Context:  r.Context,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &authzenv1.EvaluateBatchResponse{
+			Evaluations: []*authzenv1.EvaluateResponse{single},
+		}, nil
+	}
 	out := &authzenv1.EvaluateBatchResponse{
 		Evaluations: make([]*authzenv1.EvaluateResponse, len(r.Evaluations)),
 	}
@@ -360,7 +461,7 @@ func pageToProto(p *authzen.Page) (size int32, token string, props *structpb.Str
 	if err != nil {
 		return 0, "", nil, err
 	}
-	return int32(p.Limit), p.Token, props, nil
+	return clampInt32(p.Limit), p.Token, props, nil
 }
 
 // pageFromProto reassembles a core request Page (Section 8.2.1) from the flat
@@ -401,8 +502,8 @@ func pageResponseToProto(p *authzen.PageResponse) (*authzenv1.PageResponse, erro
 	}
 	return &authzenv1.PageResponse{
 		NextToken:  p.NextToken,
-		Count:      int32(p.Count),
-		Total:      int32(p.Total),
+		Count:      clampInt32(p.Count),
+		Total:      clampInt32(p.Total),
 		Properties: props,
 	}, nil
 }
@@ -510,7 +611,11 @@ func subjectSearchResponseFromProto(r *authzenv1.SearchSubjectsResponse) authzen
 	}
 	results := make([]authzen.Subject, len(r.GetResults()))
 	for i, s := range r.GetResults() {
-		results[i] = *subjectFromProto(s)
+		// A nil element in the repeated field converts to a nil *Subject;
+		// guard the deref so a malformed response cannot panic.
+		if c := subjectFromProto(s); c != nil {
+			results[i] = *c
+		}
 	}
 	return authzen.SubjectSearchResponse{
 		Page:    pageResponseFromProto(r.GetPage()),
@@ -603,7 +708,11 @@ func resourceSearchResponseFromProto(r *authzenv1.SearchResourcesResponse) authz
 	}
 	results := make([]authzen.Resource, len(r.GetResults()))
 	for i, res := range r.GetResults() {
-		results[i] = *resourceFromProto(res)
+		// A nil element in the repeated field converts to a nil *Resource;
+		// guard the deref so a malformed response cannot panic.
+		if c := resourceFromProto(res); c != nil {
+			results[i] = *c
+		}
 	}
 	return authzen.ResourceSearchResponse{
 		Page:    pageResponseFromProto(r.GetPage()),
@@ -690,7 +799,11 @@ func actionSearchResponseFromProto(r *authzenv1.SearchActionsResponse) authzen.A
 	}
 	results := make([]authzen.Action, len(r.GetResults()))
 	for i, a := range r.GetResults() {
-		results[i] = *actionFromProto(a)
+		// A nil element in the repeated field converts to a nil *Action;
+		// guard the deref so a malformed response cannot panic.
+		if c := actionFromProto(a); c != nil {
+			results[i] = *c
+		}
 	}
 	return authzen.ActionSearchResponse{
 		Page:    pageResponseFromProto(r.GetPage()),

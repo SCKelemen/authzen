@@ -123,6 +123,12 @@ func (s *Server) SearchSubjects(ctx context.Context, in *authzenv1.SearchSubject
 	if err := req.Validate(); err != nil {
 		return nil, invalidArgument(err)
 	}
+	// The searched subject carries a type only; any supplied id MUST be ignored
+	// (Section 8.4). Strip it before handing the request to the PDP, mirroring
+	// the HTTP binding.
+	if req.Subject != nil {
+		req.Subject.ID = ""
+	}
 	resp, err := s.pdp.SearchSubjects(ctx, req)
 	if err != nil {
 		return nil, pdpError(err)
@@ -135,6 +141,12 @@ func (s *Server) SearchResources(ctx context.Context, in *authzenv1.SearchResour
 	req := resourceSearchRequestFromProto(in)
 	if err := req.Validate(); err != nil {
 		return nil, invalidArgument(err)
+	}
+	// The searched resource carries a type only; any supplied id MUST be ignored
+	// (Section 8.5). Strip it before handing the request to the PDP, mirroring
+	// the HTTP binding.
+	if req.Resource != nil {
+		req.Resource.ID = ""
 	}
 	resp, err := s.pdp.SearchResources(ctx, req)
 	if err != nil {
