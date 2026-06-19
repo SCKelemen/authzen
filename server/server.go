@@ -17,11 +17,40 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"mime"
 	"net/http"
+	"runtime/debug"
+	"strings"
 
 	authzen "github.com/SCKelemen/authzen"
+)
+
+// Transport-hardening defaults. All are configurable via HandlerOptions; the
+// constants document the sane zero-value fallbacks applied by NewHandler.
+const (
+	// DefaultMaxBodyBytes caps the number of bytes a handler will read from a
+	// request body before rejecting it with HTTP 413. It defends the PDP
+	// against unbounded, pre-authentication request bodies (a DoS vector).
+	// Override with WithMaxBodyBytes.
+	DefaultMaxBodyBytes int64 = 1 << 20 // 1 MiB
+
+	// DefaultMaxBatchSize caps the number of member evaluations accepted by the
+	// Access Evaluations (batch) API before fan-out. A request exceeding it is
+	// rejected with HTTP 400, bounding the work a single request can schedule.
+	// Override with WithMaxBatchSize.
+	DefaultMaxBatchSize = 1000
+
+	// maxRequestIDLen caps the length of a client-supplied X-Request-ID that the
+	// PDP will echo (Section 10.1.3). Combined with charset filtering this
+	// prevents header-reflection abuse (oversized values, header/response
+	// splitting via control characters).
+	maxRequestIDLen = 128
 )
 
 // PDP is the decision logic a user implements. The handler adapts these methods
@@ -136,12 +165,28 @@ type Handler struct {
 	pdp      PDP
 	metadata *authzen.Metadata
 	mux      *http.ServeMux
+	// handler is the request-serving chain (recovery middleware wrapping mux).
+	handler http.Handler
 
 	evaluationPath     string
 	evaluationsPath    string
 	searchSubjectPath  string
 	searchResourcePath string
 	searchActionPath   string
+
+	// maxBodyBytes is the per-request body cap (HTTP 413 when exceeded). A
+	// non-positive value is normalized to DefaultMaxBodyBytes by NewHandler.
+	maxBodyBytes int64
+	// maxBatchSize is the cap on batch members (HTTP 400 when exceeded). A
+	// non-positive value is normalized to DefaultMaxBatchSize by NewHandler.
+	maxBatchSize int
+	// verboseErrors, when true, returns the underlying error detail to the
+	// client instead of a generic message. Default OFF to avoid leaking
+	// backend internals (Section 10.1.2). Server-side logging is unaffected.
+	verboseErrors bool
+	// logger records server-side error/panic detail. Never nil after
+	// NewHandler (defaults to slog.Default()).
+	logger *slog.Logger
 }
 
 // HandlerOption configures a Handler built with NewHandler.
@@ -187,6 +232,39 @@ func WithSearchActionPath(p string) HandlerOption {
 	return func(h *Handler) { h.searchActionPath = p }
 }
 
+// WithMaxBodyBytes overrides the per-request body cap enforced by every
+// body-reading handler. A request whose body exceeds the cap is rejected with
+// HTTP 413 (Payload Too Large) before the PDP is invoked. A non-positive value
+// resets the cap to DefaultMaxBodyBytes.
+func WithMaxBodyBytes(n int64) HandlerOption {
+	return func(h *Handler) { h.maxBodyBytes = n }
+}
+
+// WithMaxBatchSize overrides the cap on the number of member evaluations
+// accepted by the Access Evaluations (batch) API. A request exceeding the cap
+// is rejected with HTTP 400 before any fan-out. A non-positive value resets the
+// cap to DefaultMaxBatchSize.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 7 (Access Evaluations API).
+// https://openid.net/specs/authorization-api-1_0.html#name-access-evaluations-api
+func WithMaxBatchSize(n int) HandlerOption {
+	return func(h *Handler) { h.maxBatchSize = n }
+}
+
+// WithVerboseErrors controls whether client-facing error bodies carry the
+// underlying error detail. It defaults to false: clients receive a generic
+// message while the detail is logged server-side with a correlation id. Enable
+// it only in trusted/debug environments (Section 10.1.2).
+func WithVerboseErrors(enabled bool) HandlerOption {
+	return func(h *Handler) { h.verboseErrors = enabled }
+}
+
+// WithErrorLogger sets the slog.Logger used to record server-side error and
+// panic detail. A nil logger resets to slog.Default().
+func WithErrorLogger(l *slog.Logger) HandlerOption {
+	return func(h *Handler) { h.logger = l }
+}
+
 // NewHandler builds an http.Handler serving the AuthZEN APIs for pdp. Routing
 // uses net/http.ServeMux. Each API path is matched regardless of method so the
 // handler can return JSON errors with correct status codes (405 for the wrong
@@ -203,9 +281,22 @@ func NewHandler(pdp PDP, opts ...HandlerOption) *Handler {
 		searchSubjectPath:  authzen.DefaultSearchSubjectPath,
 		searchResourcePath: authzen.DefaultSearchResourcePath,
 		searchActionPath:   authzen.DefaultSearchActionPath,
+		maxBodyBytes:       DefaultMaxBodyBytes,
+		maxBatchSize:       DefaultMaxBatchSize,
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	// Normalize zero/negative knobs to their sane defaults so a misconfigured
+	// option can never disable the safety limits.
+	if h.maxBodyBytes <= 0 {
+		h.maxBodyBytes = DefaultMaxBodyBytes
+	}
+	if h.maxBatchSize <= 0 {
+		h.maxBatchSize = DefaultMaxBatchSize
+	}
+	if h.logger == nil {
+		h.logger = slog.Default()
 	}
 
 	mux := http.NewServeMux()
@@ -220,13 +311,71 @@ func NewHandler(pdp PDP, opts ...HandlerOption) *Handler {
 	mux.HandleFunc(authzen.WellKnownConfigurationPath, h.handleMetadata)
 	mux.HandleFunc("/", h.handleNotFound)
 	h.mux = mux
+	// Wrap routing in panic-recovery middleware so a panic in the PDP or a
+	// handler always fails closed to a generic 500 (never a leaked stack).
+	h.handler = h.recoverMiddleware(mux)
 
 	return h
 }
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
+	h.handler.ServeHTTP(w, r)
+}
+
+// recoverMiddleware wraps next so that any panic is recovered and converted to
+// a generic HTTP 500. The panic value and stack are logged server-side with a
+// correlation id; they are never sent to the client. If the wrapped handler has
+// not yet written a response, a generic JSON 500 is emitted (fail closed); if a
+// response was already partially written, the panic is logged and the connection
+// is left for the server to tear down.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 10.1.2 (Error responses): a PDP
+// failure is an HTTP 500 with a JSON body and no sensitive detail.
+// https://openid.net/specs/authorization-api-1_0.html#name-error-responses
+func (h *Handler) recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rw := &recoveryWriter{ResponseWriter: w}
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			// http.ErrAbortHandler is the documented way to abort a handler;
+			// propagate it so the server can handle it as intended.
+			if rec == http.ErrAbortHandler {
+				panic(rec)
+			}
+			cid := correlationID(r)
+			h.logger.Error("panic recovered in AuthZEN handler",
+				slog.Any("panic", rec),
+				slog.String("path", r.URL.Path),
+				slog.String("correlation_id", cid),
+				slog.String("stack", string(debug.Stack())),
+			)
+			if !rw.wroteHeader {
+				writeErrorWithID(w, r, http.StatusInternalServerError, "internal server error", cid)
+			}
+		}()
+		next.ServeHTTP(rw, r)
+	})
+}
+
+// recoveryWriter tracks whether the response status line has been written so the
+// recovery middleware knows whether it can still emit a clean 500.
+type recoveryWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (rw *recoveryWriter) WriteHeader(code int) {
+	rw.wroteHeader = true
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *recoveryWriter) Write(b []byte) (int, error) {
+	rw.wroteHeader = true
+	return rw.ResponseWriter.Write(b)
 }
 
 // handleEvaluation serves POST /access/v1/evaluation (Section 6).
@@ -235,7 +384,7 @@ func (h *Handler) handleEvaluation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req authzen.EvaluationRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -244,7 +393,7 @@ func (h *Handler) handleEvaluation(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.pdp.Evaluate(r.Context(), &req)
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, err.Error())
+		h.writeServerError(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, r, http.StatusOK, resp)
@@ -258,11 +407,19 @@ func (h *Handler) handleEvaluations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req authzen.EvaluationsRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if err := req.Validate(); err != nil {
 		writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Bound the fan-out BEFORE evaluating any member: a single request must not
+	// be able to schedule unbounded work. This is a client-supplied-shape error
+	// (HTTP 400), reported with a clear, non-sensitive message.
+	if n := len(req.Evaluations); n > h.maxBatchSize {
+		writeError(w, r, http.StatusBadRequest,
+			fmt.Sprintf("batch too large: %d evaluations exceeds the maximum of %d", n, h.maxBatchSize))
 		return
 	}
 
@@ -276,8 +433,16 @@ func (h *Handler) handleEvaluations(w http.ResponseWriter, r *http.Request) {
 		resp, err = EvaluateBatch(r.Context(), h.pdp, &req)
 	}
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, err.Error())
+		h.writeServerError(w, r, http.StatusInternalServerError, err)
 		return
+	}
+	// Ensure the server handler path never marshals a null evaluations array: an
+	// empty result MUST serialize as [] (a JSON array), not null. The default
+	// EvaluateBatch always returns a non-nil slice; a custom BatchEvaluator might
+	// not, so normalize here (Section 7.2). Core marshaling for nested types is
+	// owned by the core package.
+	if resp != nil && resp.Evaluations == nil {
+		resp.Evaluations = []authzen.EvaluationResponse{}
 	}
 	writeJSON(w, r, http.StatusOK, resp)
 }
@@ -288,7 +453,7 @@ func (h *Handler) handleSearchSubject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req authzen.SubjectSearchRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -302,7 +467,7 @@ func (h *Handler) handleSearchSubject(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.pdp.SearchSubjects(r.Context(), &req)
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, err.Error())
+		h.writeServerError(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, r, http.StatusOK, resp)
@@ -314,7 +479,7 @@ func (h *Handler) handleSearchResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req authzen.ResourceSearchRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -328,7 +493,7 @@ func (h *Handler) handleSearchResource(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.pdp.SearchResources(r.Context(), &req)
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, err.Error())
+		h.writeServerError(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, r, http.StatusOK, resp)
@@ -340,7 +505,7 @@ func (h *Handler) handleSearchAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req authzen.ActionSearchRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.decodeJSON(w, r, &req) {
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -349,7 +514,7 @@ func (h *Handler) handleSearchAction(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.pdp.SearchActions(r.Context(), &req)
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, err.Error())
+		h.writeServerError(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, r, http.StatusOK, resp)
@@ -375,9 +540,23 @@ func (h *Handler) handleNotFound(w http.ResponseWriter, r *http.Request) {
 
 // requirePost enforces that an API request uses POST with a JSON body. It writes
 // a 405 for any other method and a 415 when the Content-Type is not
-// application/json, returning false in either case (Section 10.1).
+// application/json, returning false in either case.
 //
-// OpenID AuthZEN Authorization API 1.0, Section 10.1 (Transport).
+// Conformance note (deliberate handling vs the spec's status-code table):
+// AuthZEN defines the request binding as "POST ... Content-Type:
+// application/json" (Section 10.1) but its error table (Table 2) only
+// enumerates 200/400/401/403/500. We deliberately ALSO use the standard HTTP
+// transport codes the table does not list:
+//   - 405 Method Not Allowed for a non-POST method, and
+//   - 415 Unsupported Media Type for a non-JSON Content-Type,
+//
+// because they are the correct, least-surprising HTTP semantics and let a PEP
+// distinguish a transport mistake from an authorization decision (a deny is
+// always a 200 with {"decision": false}, never a 4xx; Section 10.1.2). Both
+// responses still carry the JSON {"error": ...} body shape (see errorBody).
+//
+// OpenID AuthZEN Authorization API 1.0, Section 10.1 (Transport), Table 2
+// (Status codes).
 // https://openid.net/specs/authorization-api-1_0.html#name-transport
 func requirePost(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method != http.MethodPost {
@@ -404,30 +583,53 @@ func isJSONContentType(ct string) bool {
 	return mediaType == "application/json"
 }
 
-// decodeJSON decodes the request body into v, writing a 400 JSON error and
-// returning false on malformed input. Unknown fields are ignored for forward
+// decodeJSON decodes the request body into v, writing a JSON error and returning
+// false on failure. The body is wrapped in an http.MaxBytesReader capped at
+// h.maxBodyBytes so an unbounded (potentially pre-authentication) body cannot
+// exhaust memory: exceeding the cap yields HTTP 413 (Payload Too Large). Other
+// malformed input yields HTTP 400. Unknown fields are ignored for forward
 // compatibility (Section 10.1.1).
+//
+// The 400 body is intentionally generic (it does not echo the parser's error
+// text) to avoid leaking input-shape detail; the precise decode error is not
+// security-sensitive but is omitted for consistency with the error-hygiene
+// policy (Section 10.1.2).
 //
 // OpenID AuthZEN Authorization API 1.0, Section 10.1.1 (JSON Serialization).
 // https://openid.net/specs/authorization-api-1_0.html#name-json-serialization
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+func (h *Handler) decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
-		writeError(w, r, http.StatusBadRequest, "malformed JSON request body: "+err.Error())
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, r, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("request body too large: limit is %d bytes", h.maxBodyBytes))
+			return false
+		}
+		writeError(w, r, http.StatusBadRequest, "malformed JSON request body")
 		return false
 	}
 	return true
 }
 
-// errorBody is the JSON shape used for transport-level error responses. The
-// specification describes the error body as a message string (Table 2); this
-// PDP wraps that message in a small JSON object so that every response,
-// including errors, is application/json.
+// errorBody is the JSON shape used for transport-level error responses.
 //
-// OpenID AuthZEN Authorization API 1.0, Section 10.1.2 (Error responses).
+// Conformance note (deliberate body shape): the specification's error table
+// (Table 2) describes an error simply as a "Reason" string; it does not mandate
+// a JSON envelope. This PDP deliberately wraps that reason in a small JSON
+// object, {"error": "<reason>"}, so that EVERY response the PDP emits -
+// successes and errors alike - is valid application/json and a PEP can parse it
+// uniformly. The optional request_id field carries the correlation id for a
+// server-side error so an operator can find the matching log line without the
+// PDP leaking backend detail to the caller.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 10.1.2 (Error responses), Table
+// 2 (Status codes).
 // https://openid.net/specs/authorization-api-1_0.html#name-error-responses
 type errorBody struct {
-	Error string `json:"error"`
+	Error     string `json:"error"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // writeError writes a JSON error response with the given status code.
@@ -435,15 +637,95 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, message stri
 	writeJSON(w, r, status, errorBody{Error: message})
 }
 
+// writeErrorWithID writes a JSON error response carrying a correlation id, so an
+// operator can tie a generic client-facing error back to the detailed
+// server-side log entry.
+func writeErrorWithID(w http.ResponseWriter, r *http.Request, status int, message, requestID string) {
+	writeJSON(w, r, status, errorBody{Error: message, RequestID: requestID})
+}
+
+// writeServerError handles a backend/PDP failure. It NEVER returns the raw
+// error to the client (an info-leak risk, especially on HTTP 500 paths).
+// Instead it generates a correlation id, logs the full error detail server-side
+// against that id, and returns a generic message plus the id to the client.
+// When verbose errors are explicitly enabled (WithVerboseErrors), the detail is
+// echoed to the client as well - intended only for trusted/debug environments.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 10.1.2 (Error responses).
+// https://openid.net/specs/authorization-api-1_0.html#name-error-responses
+func (h *Handler) writeServerError(w http.ResponseWriter, r *http.Request, status int, err error) {
+	cid := correlationID(r)
+	h.logger.Error("AuthZEN handler error",
+		slog.String("error", err.Error()),
+		slog.String("path", r.URL.Path),
+		slog.Int("status", status),
+		slog.String("correlation_id", cid),
+	)
+	message := "internal server error"
+	if h.verboseErrors {
+		message = err.Error()
+	}
+	writeErrorWithID(w, r, status, message, cid)
+}
+
+// correlationID derives a stable id for one request: it reuses a sanitized
+// client-supplied X-Request-ID when present (so client and server logs line up),
+// otherwise it generates a fresh random id. It never returns attacker-controlled
+// raw input.
+func correlationID(r *http.Request) string {
+	if id := sanitizeRequestID(r.Header.Get("X-Request-ID")); id != "" {
+		return id
+	}
+	return newCorrelationID()
+}
+
+// newCorrelationID returns a random hex correlation id, or "unknown" if the
+// system RNG is unavailable (which should never happen in practice).
+func newCorrelationID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "unknown"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// sanitizeRequestID bounds an echoed, client-supplied request id (Section
+// 10.1.3). It truncates to maxRequestIDLen bytes and strips every character
+// outside a conservative allowlist (ASCII alphanumerics plus '-', '_', '.').
+// This prevents header-reflection abuse: oversized values and response/header
+// splitting via CR/LF or other control characters.
+func sanitizeRequestID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if len(id) > maxRequestIDLen {
+		id = id[:maxRequestIDLen]
+	}
+	var b strings.Builder
+	b.Grow(len(id))
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.':
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 // writeJSON serializes v as JSON with the given status code, always setting
 // Content-Type: application/json and echoing any X-Request-ID supplied by the
-// PEP (Section 10.1.3).
+// PEP after sanitizing it (Section 10.1.3). The sanitized value caps length and
+// charset to prevent header-reflection abuse.
 //
 // OpenID AuthZEN Authorization API 1.0, Section 10.1.3 (Request identification).
 // https://openid.net/specs/authorization-api-1_0.html#name-request-identification
 func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	if id := r.Header.Get("X-Request-ID"); id != "" {
+	if id := sanitizeRequestID(r.Header.Get("X-Request-ID")); id != "" {
 		w.Header().Set("X-Request-ID", id)
 	}
 	w.WriteHeader(status)
