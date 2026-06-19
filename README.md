@@ -3,7 +3,7 @@
 [![CI](https://github.com/SCKelemen/authzen/actions/workflows/ci.yml/badge.svg)](https://github.com/SCKelemen/authzen/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/SCKelemen/authzen.svg)](https://pkg.go.dev/github.com/SCKelemen/authzen)
 [![Go Report Card](https://goreportcard.com/badge/github.com/SCKelemen/authzen)](https://goreportcard.com/report/github.com/SCKelemen/authzen)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+[![License](https://img.shields.io/badge/license-BearWare%201.0-blue.svg)](./LICENSE)
 
 A clean, dependency-light Go implementation of the **OpenID AuthZEN
 Authorization API 1.0** — the standard for how a Policy Enforcement Point (PEP)
@@ -284,9 +284,8 @@ make check      # buf lint + go vet + build + test
 
 ## License
 
-Licensed under the **Apache License 2.0** — see [LICENSE](./LICENSE). Apache 2.0
-is the customary choice for OpenID-ecosystem libraries (it pairs a permissive
-grant with an explicit patent license), which keeps this implementation easy to
-adopt alongside the specification.
+Licensed under the **BearWare 1.0** license — see [LICENSE](./LICENSE). BearWare
+1.0 is an MIT-compatible permissive license used across the
+`github.com/SCKelemen/*` repositories.
 
 Copyright 2026 Samuel Kelemen.
