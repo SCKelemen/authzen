@@ -1,5 +1,7 @@
 package authzen
 
+import "encoding/json"
+
 // Page is the pagination object sent in a Search request. The first request
 // omits token; subsequent requests repeat the opaque next_token returned by the
 // PDP until it is the empty string. When a token is supplied, all other request
@@ -166,6 +168,22 @@ type SubjectSearchResponse struct {
 	Context map[string]any `json:"context,omitempty"`
 }
 
+// MarshalJSON encodes the response, normalizing a nil Results slice to an empty
+// array so the REQUIRED results key is serialized as [] rather than JSON null,
+// matching the specification's response examples.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 8.3 (Search response) and
+// Section 8.4.
+// https://openid.net/specs/authorization-api-1_0.html
+func (r SubjectSearchResponse) MarshalJSON() ([]byte, error) {
+	type alias SubjectSearchResponse
+	a := alias(r)
+	if a.Results == nil {
+		a.Results = []Subject{}
+	}
+	return json.Marshal(a)
+}
+
 // ResourceSearchResponse is the body of a Resource Search response. results
 // holds zero or more resources (only of the searched type); page and context
 // are optional.
@@ -183,6 +201,22 @@ type ResourceSearchResponse struct {
 	Context map[string]any `json:"context,omitempty"`
 }
 
+// MarshalJSON encodes the response, normalizing a nil Results slice to an empty
+// array so the REQUIRED results key is serialized as [] rather than JSON null,
+// matching the specification's response examples.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 8.3 (Search response) and
+// Section 8.5.
+// https://openid.net/specs/authorization-api-1_0.html
+func (r ResourceSearchResponse) MarshalJSON() ([]byte, error) {
+	type alias ResourceSearchResponse
+	a := alias(r)
+	if a.Results == nil {
+		a.Results = []Resource{}
+	}
+	return json.Marshal(a)
+}
+
 // ActionSearchResponse is the body of an Action Search response. results holds
 // zero or more actions; page and context are optional.
 //
@@ -197,4 +231,20 @@ type ActionSearchResponse struct {
 	Results []Action `json:"results"`
 	// Context carries optional, implementation-specific information. OPTIONAL.
 	Context map[string]any `json:"context,omitempty"`
+}
+
+// MarshalJSON encodes the response, normalizing a nil Results slice to an empty
+// array so the REQUIRED results key is serialized as [] rather than JSON null,
+// matching the specification's response examples.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 8.3 (Search response) and
+// Section 8.6.
+// https://openid.net/specs/authorization-api-1_0.html
+func (r ActionSearchResponse) MarshalJSON() ([]byte, error) {
+	type alias ActionSearchResponse
+	a := alias(r)
+	if a.Results == nil {
+		a.Results = []Action{}
+	}
+	return json.Marshal(a)
 }
