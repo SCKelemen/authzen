@@ -1,0 +1,361 @@
+// AccessService is a gRPC binding for the OpenID AuthZEN Authorization API 1.0.
+//
+// The spec defines a normative HTTPS + JSON binding (Section 10) and explicitly
+// permits other bindings (gRPC, CoAP) to be defined as profiles (Section 0).
+// This service mirrors the HTTP/JSON semantics as closely as possible while
+// following Google's API Improvement Proposals (https://google.aip.dev/):
+//
+//   - AIP-121  resource-oriented design
+//   - AIP-122  resource names
+//   - AIP-131/132  Get / List standard methods
+//   - AIP-136  custom methods (Evaluate / EvaluateBatch)
+//   - AIP-158  pagination (request page_size / page_token; response page object)
+//   - AIP-203  field-behavior annotations
+//
+// gRPC <-> HTTP status-code mapping (AuthZEN Section 10.1.2, Table 2). Note
+// that an authorization *deny* is a SUCCESSFUL call (OK / HTTP 200 with
+// decision=false); only request/processing failures map to error codes:
+//
+//   google.rpc.Code        HTTP   AuthZEN meaning
+//   --------------------   ----   --------------------------------------------
+//   OK                     200    Request processed (decision may be allow/deny)
+//   INVALID_ARGUMENT       400    Missing/invalid required attribute (MUST 400)
+//   UNAUTHENTICATED        401    PEP failed to authenticate to the PDP
+//   PERMISSION_DENIED      403    Forbidden (transport-level, NOT a policy deny)
+//   INTERNAL               500    Internal PDP error
+//
+// Spec: https://openid.net/specs/authorization-api-1_0.html
+syntax = "proto3";
+
+package authzen.v1;
+
+import "authzen/v1/types.proto";
+import "google/api/field_behavior.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/SCKelemen/authzen/grpc/gen/authzen/v1;authzenv1";
+
+// AccessService is the Policy Decision Point (PDP) surface. A Policy
+// Enforcement Point (PEP) is the client.
+//
+// AuthZEN Authorization API 1.0, Section 0 (Roles) and Section 6-9.
+// https://openid.net/specs/authorization-api-1_0.html
+service AccessService {
+  // Evaluate returns a single access decision: may `subject` perform `action`
+  // on `resource` in `context`? This is a custom method (AIP-136) and maps to
+  // POST /access/v1/evaluation (AuthZEN Section 6).
+  //
+  // A missing required field yields INVALID_ARGUMENT (HTTP 400). A deny is a
+  // successful response with decision=false, never an error code.
+  rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
+
+  // EvaluateBatch evaluates multiple requests in one exchange ("boxcarring").
+  // Custom method (AIP-136); maps to POST /access/v1/evaluations
+  // (AuthZEN Section 7). Top-level subject/action/resource/context provide
+  // defaults for each member, and options.evaluations_semantic selects the
+  // execution/short-circuit behavior (Section 7.1.2.1).
+  rpc EvaluateBatch(EvaluateBatchRequest) returns (EvaluateBatchResponse);
+
+  // SearchSubjects lists the subjects that may perform `action` on `resource`
+  // ("who can do X on Y?"). List-style method (AIP-132) with AIP-158
+  // pagination; maps to POST /access/v1/search/subject (AuthZEN Section 8.4).
+  rpc SearchSubjects(SearchSubjectsRequest) returns (SearchSubjectsResponse);
+
+  // SearchResources lists the resources `subject` may perform `action` on
+  // ("which Ys can X act on?"). List-style method (AIP-132) with AIP-158
+  // pagination; maps to POST /access/v1/search/resource (AuthZEN Section 8.5).
+  rpc SearchResources(SearchResourcesRequest) returns (SearchResourcesResponse);
+
+  // SearchActions lists the actions `subject` may perform on `resource`
+  // ("what can X do on Y?"). List-style method (AIP-132) with AIP-158
+  // pagination; maps to POST /access/v1/search/action (AuthZEN Section 8.6).
+  // The request carries no action.
+  rpc SearchActions(SearchActionsRequest) returns (SearchActionsResponse);
+
+  // GetConfiguration returns the PDP metadata document. Standard Get method
+  // (AIP-131); maps to GET /.well-known/authzen-configuration
+  // (AuthZEN Section 9).
+  rpc GetConfiguration(GetConfigurationRequest) returns (Configuration);
+}
+
+// EvaluateRequest is the body of a single Access Evaluation.
+//
+// The same message is reused as the element type of an EvaluateBatch
+// (Section 7.1): inside a batch any of subject/action/resource may be omitted
+// and inherited from the top-level defaults, so although they are annotated
+// REQUIRED for the standalone Evaluate call, the server only enforces presence
+// after batch defaults are applied.
+//
+// AuthZEN Authorization API 1.0, Section 6.1 (Access Evaluation Request).
+// https://openid.net/specs/authorization-api-1_0.html
+message EvaluateRequest {
+  // The principal. REQUIRED for a standalone Evaluate.
+  Subject subject = 1 [(google.api.field_behavior) = REQUIRED];
+  // The operation. REQUIRED for a standalone Evaluate.
+  Action action = 2 [(google.api.field_behavior) = REQUIRED];
+  // The target. REQUIRED for a standalone Evaluate.
+  Resource resource = 3 [(google.api.field_behavior) = REQUIRED];
+  // Environment/request attributes. OPTIONAL (Section 5.4).
+  google.protobuf.Struct context = 4 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// EvaluateResponse is the body of an Access Evaluation response (the Decision,
+// Section 5.5). decision=true permits, decision=false denies (fail-safe).
+//
+// AuthZEN Authorization API 1.0, Section 6.2 (Access Evaluation Response).
+// https://openid.net/specs/authorization-api-1_0.html
+message EvaluateResponse {
+  // true permits the request, false denies it. REQUIRED.
+  bool decision = 1 [(google.api.field_behavior) = REQUIRED];
+  // Implementation-specific reasons, advice/obligations, UI hints, or step-up
+  // instructions. OPTIONAL.
+  google.protobuf.Struct context = 2 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// EvaluationsSemantic selects how a PDP executes a batch and which decisions it
+// returns.
+//
+// AuthZEN Authorization API 1.0, Section 7.1.2.1 (evaluations_semantic).
+// https://openid.net/specs/authorization-api-1_0.html
+enum EvaluationsSemantic {
+  // Unspecified; the server treats it as EVALUATIONS_SEMANTIC_EXECUTE_ALL,
+  // matching the spec default when options.evaluations_semantic is omitted.
+  EVALUATIONS_SEMANTIC_UNSPECIFIED = 0;
+  // Execute every request (possibly in parallel); return all results in
+  // request order. Maps to "execute_all".
+  EVALUATIONS_SEMANTIC_EXECUTE_ALL = 1;
+  // Short-circuit on the first deny/failure; return up to and including it
+  // (logical AND). Maps to "deny_on_first_deny".
+  EVALUATIONS_SEMANTIC_DENY_ON_FIRST_DENY = 2;
+  // Short-circuit on the first permit; return up to and including it
+  // (logical OR). Maps to "permit_on_first_permit".
+  EVALUATIONS_SEMANTIC_PERMIT_ON_FIRST_PERMIT = 3;
+}
+
+// Options carries PEP-supplied execution metadata for a batch request.
+//
+// AuthZEN Authorization API 1.0, Section 7.1.2 (options).
+// https://openid.net/specs/authorization-api-1_0.html
+message Options {
+  // Selects the batch execution semantic. OPTIONAL; unspecified means
+  // execute_all.
+  EvaluationsSemantic evaluations_semantic = 1 [(google.api.field_behavior) = OPTIONAL];
+  // Any implementation-specific options keys other than evaluations_semantic
+  // (the spec permits arbitrary additional keys). OPTIONAL.
+  google.protobuf.Struct additional = 2 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// EvaluateBatchRequest is the body of an Access Evaluations (batch) request.
+// Top-level subject/action/resource/context are defaults applied to every
+// member of evaluations; a value set inside a member overrides the default
+// (Section 7.1.1). When evaluations is empty the request behaves identically to
+// a single Evaluate.
+//
+// AuthZEN Authorization API 1.0, Section 7.1 (Access Evaluations Request).
+// https://openid.net/specs/authorization-api-1_0.html
+message EvaluateBatchRequest {
+  // Top-level default subject. OPTIONAL (conditionally required per member).
+  Subject subject = 1 [(google.api.field_behavior) = OPTIONAL];
+  // Top-level default action. OPTIONAL (conditionally required per member).
+  Action action = 2 [(google.api.field_behavior) = OPTIONAL];
+  // Top-level default resource. OPTIONAL (conditionally required per member).
+  Resource resource = 3 [(google.api.field_behavior) = OPTIONAL];
+  // Top-level default context. OPTIONAL.
+  google.protobuf.Struct context = 4 [(google.api.field_behavior) = OPTIONAL];
+  // The discrete sub-requests. OPTIONAL; when empty the request is treated as a
+  // single evaluation built from the top-level fields.
+  repeated EvaluateRequest evaluations = 5 [(google.api.field_behavior) = OPTIONAL];
+  // Execution metadata such as evaluations_semantic. OPTIONAL.
+  Options options = 6 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// EvaluateBatchResponse is the body of an Access Evaluations (batch) response.
+// The decisions are in the same order as the request's evaluations; for the
+// short-circuit semantics the array may be shorter, ending at the deciding
+// element (Section 7.2).
+//
+// AuthZEN Authorization API 1.0, Section 7.2 (Access Evaluations Response).
+// https://openid.net/specs/authorization-api-1_0.html
+message EvaluateBatchResponse {
+  // Per-request decisions in request order. REQUIRED.
+  repeated EvaluateResponse evaluations = 1 [(google.api.field_behavior) = REQUIRED];
+}
+
+// SearchSubjectsRequest asks which subjects of the given type may perform the
+// action on the resource. The subject carries type only; its id is ignored.
+//
+// page_size / page_token follow AIP-158 and map to the AuthZEN request page
+// object (Section 8.2.1): page_size <-> page.limit, page_token <-> page.token.
+//
+// AuthZEN Authorization API 1.0, Section 8.4 (Subject Search).
+// https://openid.net/specs/authorization-api-1_0.html
+message SearchSubjectsRequest {
+  // The subject type being searched for. REQUIRED (type only).
+  Subject subject = 1 [(google.api.field_behavior) = REQUIRED];
+  // The operation being tested. REQUIRED.
+  Action action = 2 [(google.api.field_behavior) = REQUIRED];
+  // The target of the operation. REQUIRED.
+  Resource resource = 3 [(google.api.field_behavior) = REQUIRED];
+  // Environment/request attributes. OPTIONAL.
+  google.protobuf.Struct context = 4 [(google.api.field_behavior) = OPTIONAL];
+  // Maximum number of results to return (AIP-158); maps to page.limit. OPTIONAL.
+  int32 page_size = 5 [(google.api.field_behavior) = OPTIONAL];
+  // Opaque cursor from a previous response's next_page_token (AIP-158); maps to
+  // page.token. When set, all other fields MUST match the prior request. OPTIONAL.
+  string page_token = 6 [(google.api.field_behavior) = OPTIONAL];
+  // Implementation-specific paging hints (sorting/filtering); maps to
+  // page.properties. OPTIONAL.
+  google.protobuf.Struct page_properties = 7 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// PageResponse is the response pagination object shared by every Search
+// response. It mirrors the AuthZEN page object (Section 8.2.2) one-for-one and
+// is carried as a distinct, nullable message rather than as flat AIP-158
+// next_page_token/total_size fields, for two reasons:
+//
+//   1. Fidelity: AuthZEN's page object has a `count` field that AIP-158's flat
+//      response convention omits; a dedicated message can carry it losslessly.
+//   2. Presence: a Search response MUST include the page object when the result
+//      set is incomplete (Section 8.2.2), and a page that is present but empty
+//      (the end-of-results marker: next_token="" with everything else zero) is
+//      semantically distinct from an absent page. A nullable message captures
+//      that distinction exactly, where flat scalar fields could not.
+//
+// page.next_token is the AIP-158 next_page_token analogue and page.total is the
+// total_size analogue.
+//
+// AuthZEN Authorization API 1.0, Section 8.2.2 (Response page object).
+// https://openid.net/specs/authorization-api-1_0.html
+message PageResponse {
+  // Opaque cursor for the next page; empty string means no more results.
+  // REQUIRED when the page object is present (AIP-158 next_page_token analogue).
+  string next_token = 1 [(google.api.field_behavior) = OPTIONAL];
+  // Number of results in this response. OPTIONAL.
+  int32 count = 2 [(google.api.field_behavior) = OPTIONAL];
+  // Total matching results at request time, not guaranteed stable (AIP-158
+  // total_size analogue). OPTIONAL.
+  int32 total = 3 [(google.api.field_behavior) = OPTIONAL];
+  // Implementation-specific paging metadata; maps to page.properties. OPTIONAL.
+  google.protobuf.Struct properties = 4 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// SearchSubjectsResponse holds the authorized subjects and pagination metadata.
+//
+// AuthZEN Authorization API 1.0, Sections 8.3 and 8.4.
+// https://openid.net/specs/authorization-api-1_0.html
+message SearchSubjectsResponse {
+  // The authorized subjects. REQUIRED (may be empty).
+  repeated Subject results = 1 [(google.api.field_behavior) = REQUIRED];
+  // Pagination metadata; present (possibly empty) when the response carries a
+  // page object, absent otherwise (Section 8.2.2). OPTIONAL.
+  PageResponse page = 2 [(google.api.field_behavior) = OPTIONAL];
+  // Implementation-specific information; maps to the search response context.
+  // OPTIONAL.
+  google.protobuf.Struct context = 3 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// SearchResourcesRequest asks which resources of the given type the subject may
+// perform the action on. The resource carries type only; its id is ignored.
+//
+// AuthZEN Authorization API 1.0, Section 8.5 (Resource Search).
+// https://openid.net/specs/authorization-api-1_0.html
+message SearchResourcesRequest {
+  // The principal. REQUIRED.
+  Subject subject = 1 [(google.api.field_behavior) = REQUIRED];
+  // The operation being tested. REQUIRED.
+  Action action = 2 [(google.api.field_behavior) = REQUIRED];
+  // The resource type being searched for. REQUIRED (type only).
+  Resource resource = 3 [(google.api.field_behavior) = REQUIRED];
+  // Environment/request attributes. OPTIONAL.
+  google.protobuf.Struct context = 4 [(google.api.field_behavior) = OPTIONAL];
+  // Maximum number of results (AIP-158); maps to page.limit. OPTIONAL.
+  int32 page_size = 5 [(google.api.field_behavior) = OPTIONAL];
+  // Opaque cursor (AIP-158); maps to page.token. OPTIONAL.
+  string page_token = 6 [(google.api.field_behavior) = OPTIONAL];
+  // Implementation-specific paging hints; maps to page.properties. OPTIONAL.
+  google.protobuf.Struct page_properties = 7 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// SearchResourcesResponse holds the authorized resources and pagination metadata.
+//
+// AuthZEN Authorization API 1.0, Sections 8.3 and 8.5.
+// https://openid.net/specs/authorization-api-1_0.html
+message SearchResourcesResponse {
+  // The authorized resources. REQUIRED (may be empty).
+  repeated Resource results = 1 [(google.api.field_behavior) = REQUIRED];
+  // Pagination metadata; present (possibly empty) when the response carries a
+  // page object, absent otherwise (Section 8.2.2). OPTIONAL.
+  PageResponse page = 2 [(google.api.field_behavior) = OPTIONAL];
+  // Implementation-specific information; maps to the search response context.
+  // OPTIONAL.
+  google.protobuf.Struct context = 3 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// SearchActionsRequest asks which actions the subject may perform on the
+// resource. There is deliberately no action field (Section 8.6).
+//
+// AuthZEN Authorization API 1.0, Section 8.6 (Action Search).
+// https://openid.net/specs/authorization-api-1_0.html
+message SearchActionsRequest {
+  // The principal. REQUIRED.
+  Subject subject = 1 [(google.api.field_behavior) = REQUIRED];
+  // The target. REQUIRED.
+  Resource resource = 2 [(google.api.field_behavior) = REQUIRED];
+  // Environment/request attributes. OPTIONAL.
+  google.protobuf.Struct context = 3 [(google.api.field_behavior) = OPTIONAL];
+  // Maximum number of results (AIP-158); maps to page.limit. OPTIONAL.
+  int32 page_size = 4 [(google.api.field_behavior) = OPTIONAL];
+  // Opaque cursor (AIP-158); maps to page.token. OPTIONAL.
+  string page_token = 5 [(google.api.field_behavior) = OPTIONAL];
+  // Implementation-specific paging hints; maps to page.properties. OPTIONAL.
+  google.protobuf.Struct page_properties = 6 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// SearchActionsResponse holds the authorized actions and pagination metadata.
+//
+// AuthZEN Authorization API 1.0, Sections 8.3 and 8.6.
+// https://openid.net/specs/authorization-api-1_0.html
+message SearchActionsResponse {
+  // The authorized actions. REQUIRED (may be empty).
+  repeated Action results = 1 [(google.api.field_behavior) = REQUIRED];
+  // Pagination metadata; present (possibly empty) when the response carries a
+  // page object, absent otherwise (Section 8.2.2). OPTIONAL.
+  PageResponse page = 2 [(google.api.field_behavior) = OPTIONAL];
+  // Implementation-specific information; maps to the search response context.
+  // OPTIONAL.
+  google.protobuf.Struct context = 3 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// GetConfigurationRequest is the (empty) request for the PDP metadata document.
+// Per AIP-131 a Get method takes a request message even when it carries no
+// fields, leaving room for future additions (for example a tenant selector).
+//
+// AuthZEN Authorization API 1.0, Section 9.2 (Obtaining metadata).
+// https://openid.net/specs/authorization-api-1_0.html
+message GetConfigurationRequest {}
+
+// Configuration is the PDP metadata document published at
+// /.well-known/authzen-configuration. An absent (empty) endpoint signals that
+// the corresponding API is unsupported.
+//
+// AuthZEN Authorization API 1.0, Section 9.1 (Metadata).
+// https://openid.net/specs/authorization-api-1_0.html
+message Configuration {
+  // Base URL of the PDP. REQUIRED.
+  string policy_decision_point = 1 [(google.api.field_behavior) = REQUIRED];
+  // URL of the Access Evaluation API. REQUIRED.
+  string access_evaluation_endpoint = 2 [(google.api.field_behavior) = REQUIRED];
+  // URL of the Access Evaluations (batch) API. OPTIONAL.
+  string access_evaluations_endpoint = 3 [(google.api.field_behavior) = OPTIONAL];
+  // URL of the Subject Search API. OPTIONAL.
+  string search_subject_endpoint = 4 [(google.api.field_behavior) = OPTIONAL];
+  // URL of the Resource Search API. OPTIONAL.
+  string search_resource_endpoint = 5 [(google.api.field_behavior) = OPTIONAL];
+  // URL of the Action Search API. OPTIONAL.
+  string search_action_endpoint = 6 [(google.api.field_behavior) = OPTIONAL];
+  // Registered IANA capability URNs. OPTIONAL.
+  repeated string capabilities = 7 [(google.api.field_behavior) = OPTIONAL];
+  // A JWT asserting the other parameters as claims; takes precedence where
+  // supported. OPTIONAL.
+  string signed_metadata = 8 [(google.api.field_behavior) = OPTIONAL];
+}

@@ -1,0 +1,21 @@
+version: v2
+modules:
+  - path: proto
+# The google.api.field_behavior annotations (AIP-203) live in the public
+# googleapis module. google.protobuf.* well-known types ship with the compiler
+# and need no dependency.
+deps:
+  - buf.build/googleapis/googleapis
+lint:
+  use:
+    - STANDARD
+  except:
+    # Our package layout mirrors the spec/proto path rather than buf's directory
+    # recommendation.
+    - PACKAGE_DIRECTORY_MATCH
+    # GetConfiguration is an AIP-131 standard Get and returns the resource
+    # itself (the Configuration metadata document), not a "...Response" wrapper.
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE

@@ -1,0 +1,82 @@
+// Common information-model messages for the OpenID AuthZEN Authorization API
+// 1.0, expressed as protocol buffers.
+//
+// These messages mirror the entities defined in the AuthZEN information model
+// (Authorization API 1.0, Section 5) one-for-one:
+//   - Subject  -> Section 5.1
+//   - Resource -> Section 5.2
+//   - Action   -> Section 5.3
+//   - Context  -> Section 5.4 (modeled as google.protobuf.Struct at the
+//     call sites that carry it; there is no dedicated message because the
+//     spec defines Context as a free-form JSON object with no required keys).
+//
+// Free-form "properties" / "context" objects use google.protobuf.Struct so
+// that arbitrary, possibly nested, JSON values survive the round-trip to and
+// from the core Go types' map[string]any fields.
+//
+// Design follows Google's API Improvement Proposals (https://google.aip.dev/):
+//   - AIP-121 resource-oriented design
+//   - AIP-122 resource names
+//   - AIP-203 field-behavior annotations (REQUIRED / OPTIONAL below)
+//
+// Spec: https://openid.net/specs/authorization-api-1_0.html
+syntax = "proto3";
+
+package authzen.v1;
+
+import "google/api/field_behavior.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/SCKelemen/authzen/grpc/gen/authzen/v1;authzenv1";
+
+// Subject is the principal (user, service, device, ...) whose access is being
+// evaluated. The (type, id) pair uniquely identifies the subject.
+//
+// AuthZEN Authorization API 1.0, Section 5.1 (Subject).
+// https://openid.net/specs/authorization-api-1_0.html
+message Subject {
+  // Type of the subject. REQUIRED in every context.
+  string type = 1 [(google.api.field_behavior) = REQUIRED];
+
+  // Unique identifier of the subject, scoped to type. REQUIRED for an
+  // evaluation (Section 6.1); for a Subject Search query (Section 8.4) it
+  // SHOULD be omitted and MUST be ignored if present. It is therefore marked
+  // OPTIONAL at the proto level and enforced per-method by the server.
+  string id = 2 [(google.api.field_behavior) = OPTIONAL];
+
+  // Additional subject attributes (simple or complex values), for example
+  // department, group memberships, device_id, or ip_address. OPTIONAL.
+  google.protobuf.Struct properties = 3 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// Resource is the target of the requested access (the protected object). The
+// (type, id) pair uniquely identifies the resource.
+//
+// AuthZEN Authorization API 1.0, Section 5.2 (Resource).
+// https://openid.net/specs/authorization-api-1_0.html
+message Resource {
+  // Type of the resource. REQUIRED in every context.
+  string type = 1 [(google.api.field_behavior) = REQUIRED];
+
+  // Unique identifier of the resource, scoped to type. REQUIRED for an
+  // evaluation (Section 6.1); for a Resource Search query (Section 8.5) it
+  // SHOULD be omitted and MUST be ignored if present.
+  string id = 2 [(google.api.field_behavior) = OPTIONAL];
+
+  // Additional resource attributes/metadata, which may be nested objects.
+  // OPTIONAL.
+  google.protobuf.Struct properties = 3 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// Action is the verb or operation the subject wishes to perform on the
+// resource.
+//
+// AuthZEN Authorization API 1.0, Section 5.3 (Action).
+// https://openid.net/specs/authorization-api-1_0.html
+message Action {
+  // Name of the action. REQUIRED.
+  string name = 1 [(google.api.field_behavior) = REQUIRED];
+
+  // Additional action parameters. OPTIONAL.
+  google.protobuf.Struct properties = 2 [(google.api.field_behavior) = OPTIONAL];
+}
