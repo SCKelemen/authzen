@@ -107,6 +107,16 @@ type BatchEvaluator interface {
 // a deny and therefore short-circuits; for permit_on_first_permit it is not a
 // permit and evaluation continues. Decisions default closed (Section 5.5).
 //
+// Error hygiene: the per-member "error" object NEVER carries the raw backend
+// error message by default, since that can leak internal detail to the caller
+// (the same risk addressed for top-level HTTP 500s). Instead it carries a
+// generic message and a correlation id, while the full detail is logged
+// server-side against that id via the configured slog logger. Pass
+// WithBatchVerboseErrors(true) (wired from the handler's WithVerboseErrors) to
+// include the real message in the response - intended only for trusted/debug
+// environments. Configure the logger with WithBatchErrorLogger; when unset it
+// defaults to slog.Default().
+//
 // A genuine request-wide failure (a cancelled or expired context) is returned
 // as a non-nil error, which the handler maps to HTTP 500; that is the only
 // condition that fails the entire request.
@@ -114,7 +124,15 @@ type BatchEvaluator interface {
 // OpenID AuthZEN Authorization API 1.0, Section 7 (Access Evaluations API) and
 // Section 7.2.1 (Errors in batch).
 // https://openid.net/specs/authorization-api-1_0.html#name-access-evaluations-api
-func EvaluateBatch(ctx context.Context, pdp PDP, req *authzen.EvaluationsRequest) (*authzen.EvaluationsResponse, error) {
+func EvaluateBatch(ctx context.Context, pdp PDP, req *authzen.EvaluationsRequest, opts ...BatchOption) (*authzen.EvaluationsResponse, error) {
+	cfg := batchConfig{logger: slog.Default()}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.logger == nil {
+		cfg.logger = slog.Default()
+	}
+
 	semantic := authzen.SemanticExecuteAll
 	if req.Options != nil && req.Options.EvaluationsSemantic != "" {
 		semantic = req.Options.EvaluationsSemantic
@@ -131,15 +149,14 @@ func EvaluateBatch(ctx context.Context, pdp PDP, req *authzen.EvaluationsRequest
 				return nil, ctxErr
 			}
 			// Otherwise this is a per-member failure. Record a fail-safe closed
-			// decision with the error in the item's context (Section 7.2.1) and
-			// keep evaluating the remaining members.
+			// decision with a REDACTED error in the item's context (Section
+			// 7.2.1) and keep evaluating the remaining members. The full detail
+			// is logged server-side against the correlation id; only a generic
+			// message (or, when verbose, the real one) reaches the caller.
 			resp = &authzen.EvaluationResponse{
 				Decision: false,
 				Context: map[string]any{
-					"error": authzen.EvaluationError{
-						Status:  http.StatusInternalServerError,
-						Message: err.Error(),
-					},
+					"error": cfg.memberError(i, err),
 				},
 			}
 		}
@@ -157,6 +174,61 @@ func EvaluateBatch(ctx context.Context, pdp PDP, req *authzen.EvaluationsRequest
 		}
 	}
 	return &authzen.EvaluationsResponse{Evaluations: out}, nil
+}
+
+// genericMemberErrorMessage is the redacted message placed in a batch member's
+// error context when its backend evaluation fails. It intentionally reveals
+// nothing about the underlying cause; the detail is logged server-side.
+const genericMemberErrorMessage = "internal error evaluating this request"
+
+// batchConfig controls per-member error redaction in EvaluateBatch. Its zero
+// value (after normalization) logs to slog.Default() and redacts member errors.
+type batchConfig struct {
+	logger        *slog.Logger
+	verboseErrors bool
+}
+
+// BatchOption configures EvaluateBatch, primarily its per-member error hygiene.
+type BatchOption func(*batchConfig)
+
+// WithBatchErrorLogger sets the slog.Logger used to record the full detail of a
+// per-member backend error (against the correlation id surfaced to the caller).
+// A nil logger resets to slog.Default(). The handler wires its own logger here
+// so batch and top-level errors land in the same place.
+func WithBatchErrorLogger(l *slog.Logger) BatchOption {
+	return func(c *batchConfig) { c.logger = l }
+}
+
+// WithBatchVerboseErrors controls whether a per-member error context carries the
+// real backend error message. It defaults to false (the message is redacted to a
+// generic string plus a correlation id). Enable it only in trusted/debug
+// environments; the handler wires this from WithVerboseErrors.
+//
+// OpenID AuthZEN Authorization API 1.0, Section 7.2.1 (Errors in batch).
+// https://openid.net/specs/authorization-api-1_0.html
+func WithBatchVerboseErrors(enabled bool) BatchOption {
+	return func(c *batchConfig) { c.verboseErrors = enabled }
+}
+
+// memberError builds the redacted EvaluationError for a failed batch member. It
+// generates a correlation id, logs the full error against it, and returns a
+// generic (or, when verbose, the real) message that always carries the
+// correlation id so an operator can find the matching log line.
+func (c batchConfig) memberError(index int, err error) authzen.EvaluationError {
+	cid := newCorrelationID()
+	c.logger.Error("AuthZEN batch member error",
+		slog.Int("member_index", index),
+		slog.String("error", err.Error()),
+		slog.String("correlation_id", cid),
+	)
+	message := genericMemberErrorMessage
+	if c.verboseErrors {
+		message = err.Error()
+	}
+	return authzen.EvaluationError{
+		Status:  http.StatusInternalServerError,
+		Message: fmt.Sprintf("%s (correlation id: %s)", message, cid),
+	}
 }
 
 // Handler is an http.Handler that serves the AuthZEN APIs for a PDP. Build one
@@ -430,7 +502,11 @@ func (h *Handler) handleEvaluations(w http.ResponseWriter, r *http.Request) {
 	if be, ok := h.pdp.(BatchEvaluator); ok {
 		resp, err = be.EvaluateBatch(r.Context(), &req)
 	} else {
-		resp, err = EvaluateBatch(r.Context(), h.pdp, &req)
+		// Wire the handler's logger and verbose switch so per-member errors are
+		// redacted (and logged) with the same hygiene as top-level 500s.
+		resp, err = EvaluateBatch(r.Context(), h.pdp, &req,
+			WithBatchErrorLogger(h.logger),
+			WithBatchVerboseErrors(h.verboseErrors))
 	}
 	if err != nil {
 		h.writeServerError(w, r, http.StatusInternalServerError, err)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -315,4 +316,144 @@ func readStatusJSON(t *testing.T, resp *http.Response, want int) []byte {
 		t.Fatalf("response body is not valid JSON: %s", data)
 	}
 	return data
+}
+
+// boomBatchRequest returns a batch whose middle member errors (subject id
+// "boom" makes stubPDP return "backend exploded").
+func boomBatchRequest() *authzen.EvaluationsRequest {
+	return &authzen.EvaluationsRequest{
+		Action:  &authzen.Action{Name: "read"},
+		Options: &authzen.Options{EvaluationsSemantic: authzen.SemanticExecuteAll},
+		Evaluations: []authzen.EvaluationRequest{
+			{Subject: &authzen.Subject{Type: "user", ID: "alice@example.com"}, Resource: &authzen.Resource{Type: "document", ID: "1"}},
+			{Subject: &authzen.Subject{Type: "user", ID: "boom"}, Resource: &authzen.Resource{Type: "document", ID: "1"}},
+		},
+	}
+}
+
+// memberErrorMessage extracts the message string from a member's
+// context["error"], handling both the in-process typed shape
+// (authzen.EvaluationError) and the JSON-decoded map shape.
+func memberErrorMessage(t *testing.T, e authzen.EvaluationResponse) string {
+	t.Helper()
+	raw, ok := e.Context["error"]
+	if !ok {
+		t.Fatalf("member has no error context: %v", e.Context)
+	}
+	switch v := raw.(type) {
+	case authzen.EvaluationError:
+		return v.Message
+	case map[string]any:
+		msg, _ := v["message"].(string)
+		return msg
+	default:
+		t.Fatalf("unexpected error context type %T", raw)
+		return ""
+	}
+}
+
+// TestBatchMemberErrorRedactedAndLogged proves that, by default, a per-member
+// backend error is NOT leaked in the response context but IS logged server-side
+// against the same correlation id surfaced to the caller. Spec Section 7.2.1.
+func TestBatchMemberErrorRedactedAndLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	resp, err := server.EvaluateBatch(context.Background(), stubPDP{}, boomBatchRequest(),
+		server.WithBatchErrorLogger(logger))
+	if err != nil {
+		t.Fatalf("EvaluateBatch: %v", err)
+	}
+	if len(resp.Evaluations) != 2 {
+		t.Fatalf("len = %d, want 2", len(resp.Evaluations))
+	}
+	if resp.Evaluations[1].Decision {
+		t.Fatal("errored member must fail closed (deny)")
+	}
+
+	msg := memberErrorMessage(t, resp.Evaluations[1])
+	if strings.Contains(msg, "backend exploded") {
+		t.Fatalf("client-facing member error leaked backend detail: %q", msg)
+	}
+	if !strings.Contains(msg, "internal error evaluating this request") {
+		t.Fatalf("member error = %q, want the generic redacted message", msg)
+	}
+	// The correlation id in the message must also appear in the server log.
+	cid := correlationIDFromMessage(t, msg)
+	logged := buf.String()
+	if !strings.Contains(logged, "backend exploded") {
+		t.Fatalf("server log did not capture the backend detail: %s", logged)
+	}
+	if !strings.Contains(logged, cid) {
+		t.Fatalf("server log did not include correlation id %q: %s", cid, logged)
+	}
+}
+
+// TestBatchMemberErrorVerbose proves the WithBatchVerboseErrors switch surfaces
+// the real backend message to the caller. Spec Section 7.2.1.
+func TestBatchMemberErrorVerbose(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	resp, err := server.EvaluateBatch(context.Background(), stubPDP{}, boomBatchRequest(),
+		server.WithBatchErrorLogger(logger), server.WithBatchVerboseErrors(true))
+	if err != nil {
+		t.Fatalf("EvaluateBatch: %v", err)
+	}
+	msg := memberErrorMessage(t, resp.Evaluations[1])
+	if !strings.Contains(msg, "backend exploded") {
+		t.Fatalf("verbose member error should surface backend detail, got %q", msg)
+	}
+}
+
+// TestBatchMemberErrorRedactedOverHTTP proves the redaction holds through the
+// full HTTP handler path (default handler, verbose OFF). Spec Section 7.2.1.
+func TestBatchMemberErrorRedactedOverHTTP(t *testing.T) {
+	srv, closeFn := newRawServer(t)
+	defer closeFn()
+
+	body := `{"action":{"name":"read"},"evaluations":[` +
+		`{"subject":{"type":"user","id":"boom"},"resource":{"type":"document","id":"1"}}]}`
+	resp := mustPost(t, srv.URL+authzen.DefaultEvaluationsPath, "application/json", body)
+	defer resp.Body.Close()
+	data := readStatusJSON(t, resp, http.StatusOK)
+	if strings.Contains(string(data), "backend exploded") {
+		t.Fatalf("HTTP batch response leaked backend detail: %s", data)
+	}
+	if !strings.Contains(string(data), "correlation id") {
+		t.Fatalf("HTTP batch response missing correlation id: %s", data)
+	}
+}
+
+// TestBatchMemberErrorVerboseOverHTTP proves WithVerboseErrors on the handler
+// flows through to per-member errors over HTTP. Spec Section 7.2.1.
+func TestBatchMemberErrorVerboseOverHTTP(t *testing.T) {
+	srv, closeFn := newRawServer(t, server.WithVerboseErrors(true))
+	defer closeFn()
+
+	body := `{"action":{"name":"read"},"evaluations":[` +
+		`{"subject":{"type":"user","id":"boom"},"resource":{"type":"document","id":"1"}}]}`
+	resp := mustPost(t, srv.URL+authzen.DefaultEvaluationsPath, "application/json", body)
+	defer resp.Body.Close()
+	data := readStatusJSON(t, resp, http.StatusOK)
+	if !strings.Contains(string(data), "backend exploded") {
+		t.Fatalf("verbose HTTP batch response should surface backend detail: %s", data)
+	}
+}
+
+// correlationIDFromMessage extracts the id from a "... (correlation id: X)"
+// suffix.
+func correlationIDFromMessage(t *testing.T, msg string) string {
+	t.Helper()
+	const marker = "(correlation id: "
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		t.Fatalf("message %q has no correlation id marker", msg)
+	}
+	rest := msg[i+len(marker):]
+	j := strings.IndexByte(rest, ')')
+	if j < 0 {
+		t.Fatalf("message %q has an unterminated correlation id", msg)
+	}
+	return rest[:j]
 }

@@ -134,8 +134,22 @@ func TestBatchPerMemberErrorExecuteAll(t *testing.T) {
 	if resp.Evaluations[1].Context == nil {
 		t.Fatal("errored member should carry an error context")
 	}
-	if _, ok := resp.Evaluations[1].Context["error"]; !ok {
+	raw, ok := resp.Evaluations[1].Context["error"]
+	if !ok {
 		t.Fatalf("errored member context = %v, want an 'error' key", resp.Evaluations[1].Context)
+	}
+	// The error object MUST be redacted by default: a generic message plus a
+	// correlation id, never the raw backend detail (Section 7.2.1 hygiene).
+	errObj, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("error context = %T, want a JSON object", raw)
+	}
+	msg, _ := errObj["message"].(string)
+	if strings.Contains(msg, "backend exploded") {
+		t.Fatalf("default batch member error leaked backend detail: %q", msg)
+	}
+	if !strings.Contains(msg, "correlation id") {
+		t.Fatalf("member error = %q, want a correlation id", msg)
 	}
 }
 
