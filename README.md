@@ -137,7 +137,6 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 
 	authzen "github.com/SCKelemen/authzen"
 	"github.com/SCKelemen/authzen/server"
@@ -167,7 +166,14 @@ func main() {
 		PolicyDecisionPoint:      "https://pdp.example.com",
 		AccessEvaluationEndpoint: "https://pdp.example.com/access/v1/evaluation",
 	}))
-	log.Fatal(http.ListenAndServe(":8080", h))
+
+	// server.NewServer returns a production-hardened *http.Server — it sets
+	// ReadHeaderTimeout, ReadTimeout, WriteTimeout, IdleTimeout, and a TLS 1.2
+	// minimum, unlike the unbounded zero-value server behind
+	// http.ListenAndServe (which is open to slowloris / slow-read DoS). Serve
+	// over TLS in production with srv.ListenAndServeTLS.
+	srv := server.NewServer(":8080", h)
+	log.Fatal(srv.ListenAndServe())
 }
 ```
 
@@ -269,9 +275,11 @@ cd grpc && go test ./...
 ```
 
 CI runs the full gate on every push and pull request — `gofmt`, `go vet`,
-`go build`, and `go test -race -coverprofile=... -covermode=atomic` for **both**
-modules, plus `buf lint` and a `buf generate` + `git diff` check that fails if
-the committed generated stubs drift. See
+`staticcheck`, `go build`, and `go test -race -cover` for **both** modules, plus
+`buf lint` and a `buf generate` + `git diff` check that fails if the committed
+generated stubs drift. `govulncheck` also runs against both modules and reports
+known vulnerabilities (informational; it does not gate the build). The CI
+toolchain is pinned to a patched Go release for the stdlib security fixes. See
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 
 To regenerate the gRPC stubs after editing the protos:
@@ -288,4 +296,4 @@ Licensed under the **BearWare 1.0** license — see [LICENSE](./LICENSE). BearWa
 1.0 is an MIT-compatible permissive license used across the
 `github.com/SCKelemen/*` repositories.
 
-Copyright 2026 Samuel Kelemen.
+Copyright 2025 Samuel Kelemen.

@@ -13,7 +13,7 @@
 | Spec (GitHub Pages render) | https://openid.github.io/authzen/ | Same content, rendered from the working group repo. |
 | Working group repo | https://github.com/openid/authzen | Spec source at `api/authorization-api-1_0.md`; interop harness in `interop/`. |
 | Interop site | https://authzen-interop.net | "Todo" interop scenario + results. |
-| MCP profile | https://openid.github.io/authzen/authzen-mcp-profile-1_0.html | Profile for MCP tool authorization (out of scope here). |
+| MCP profile | https://openid.github.io/authzen/authzen-mcp-profile-1_0.html | Profile for MCP tool authorization. Implemented in-repo as the [`mcp/`](../mcp) package (non-normative AuthZEN profile mapping MCP auth onto core evaluation). |
 
 Spec lineage (for historical context — **do not implement against drafts**):
 - draft 00 — Identiverse 2024 interop target.
@@ -1449,3 +1449,105 @@ X-Request-ID: bfe9eb29-ab87-4ca3-be83-a1d5d8305716
 4. For discovery use Search APIs; iterate pagination via `page.token` until
    `next_token == ""`, keeping all other params identical.
 5. Send `X-Request-ID` for correlation; secure the channel; authenticate to PDP.
+
+---
+
+## 12. Approval-workflow extension ("aarp") — non-normative
+
+> **Status:** Non-normative, **spec-compatible** extension implemented in the
+> in-root `approval/` package. It does **not** change the AuthZEN wire format.
+
+### Problem
+
+AuthZEN's `decision` is a **REQUIRED boolean** (§5.5, §6.2); there is no native
+"pending" value for an asynchronous, human-in-the-loop decision that cannot be
+resolved synchronously at evaluation time.
+
+### Design (Option B): pending == not-yet-success
+
+The extension is layered entirely on the **decision `context`**, which §5.5.1
+designates as the extension point. A pending approval is expressed as a
+fail-safe deny carrying an `approval` object:
+
+```json
+{
+  "decision": false,
+  "context": {
+    "approval": {
+      "status": "pending",
+      "approval_id": "…opaque…",
+      "expires_in": 300,
+      "interval": 5
+    }
+  }
+}
+```
+
+- On approval → `{"decision": true, "context": {"approval": {"status": "approved", …}}}`.
+- On `denied` / `expired` / `canceled` → `decision` stays `false` with the
+  matching `status`.
+
+This mirrors **RFC 8628** (OAuth Device Grant), which expresses "pending" as a
+not-yet-success (`authorization_pending`) rather than introducing a third
+decision value. Because `decision` remains a bare boolean and the `approval`
+object lives under the free-form `context`, a PEP that does not understand the
+extension still sees a safe deny while pending.
+
+### Object shape (prior art)
+
+- Polling fields `expires_in` / `interval` and the pending/denied/expired
+  lifecycle follow **RFC 8628 §3.2/§3.5**; the opaque high-entropy
+  `approval_id` follows the device_code unguessability guidance (§5.2).
+- `delivery` (poll/ping/push) and the out-of-band handle follow **CIBA**.
+- `request_ref` (`type`, `locations`, `actions`, `datatypes`, `identifier`,
+  `privileges`) reuses the **RFC 9396** `authorization_details` shape to
+  describe *what* is pending approval.
+
+### State machine
+
+`pending` is the only non-terminal state. `approved` / `denied` / `canceled` /
+`expired` are terminal and immutable; an illegal transition is rejected. Expiry
+is lazy (evaluated on read), so no timers or background goroutines are needed.
+
+### Poll binding
+
+`GET /access/v1/approval/{id}` returns the current decision as an ordinary
+`EvaluationResponse` (HTTP `200`), echoing the poll `interval` via `Retry-After`
+while pending; an unknown id yields `404`. This extends the `/access/v1/...`
+endpoint family (§10.1) without altering any normative endpoint.
+
+### MCP elicitation tie-in
+
+A pending decision maps cleanly onto an MCP **elicitation**: accept →
+`Approve`, decline → `Deny`, cancel → `Cancel` (see the
+[AuthZEN MCP profile](https://openid.github.io/authzen/authzen-mcp-profile-1_0.html)).
+
+### Callback delivery (ping/push) & SSRF
+
+The poll binding above is the only network behavior in the core `Store`/`Handler`;
+both are poll-only and never dereference a URL. Push/ping delivery is an
+**opt-in** `Notifier` that POSTs to `callback_url` when an approval resolves,
+following the **CIBA** delivery modes: `poll` is a no-op, `ping` posts a minimal
+`{approval_id, status}`, and `push` posts the full `EvaluationResponse`. A
+resolution is surfaced via the store's `OnResolve` hook (fired exactly once per
+approval), which a caller wires to `Notifier.Notify`.
+
+Because `callback_url` (and `poll_url`) are client-supplied, dereferencing them
+is a **server-side request forgery (SSRF)** surface. The `Notifier` is therefore
+**safe by default**: it fails closed unless a caller-supplied `Validate` function
+approves the parsed URL, and its default HTTP client does **not** follow
+redirects (so a validated URL cannot be bounced to an internal address). The
+provided `AllowList` validator enforces https plus a host allow-list; callers
+should additionally block loopback, link-local, and cloud-metadata addresses.
+Values obtained via `FromContext` are untrusted input.
+
+**Caveats (residual SSRF, not mitigated — caller's responsibility):** (a) the
+no-redirect protection is set only on the default client built by
+`NewNotifier`; a caller who injects a custom `*http.Client` that follows
+redirects loses the redirect-bounce protection (preserve a no-redirect
+`CheckRedirect`, e.g. `http.ErrUseLastResponse`). (b) `AllowList` validates the
+host string, not the resolved IP, so it does not defend against DNS rebinding or
+an allow-listed host that resolves to a loopback/link-local/cloud-metadata
+address; hardened deployments should add an IP-level guard at dial time (custom
+`DialContext`) blocking private (RFC 1918), loopback, link-local
+(`169.254.0.0/16`), and the `169.254.169.254` metadata address.
