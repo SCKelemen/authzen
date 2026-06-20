@@ -35,3 +35,6 @@ go.work.sum
 # NOTE: the generated protobuf/gRPC stubs under grpc/gen/ are intentionally
 # committed and MUST NOT be ignored. CI regenerates them and fails if they
 # drift, so they stay tracked.
+
+# Local AI tool config (Slate / Random Labs) — kept on disk, not tracked.
+slate.json
