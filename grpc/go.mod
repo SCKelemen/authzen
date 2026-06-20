@@ -2,6 +2,10 @@ module github.com/SCKelemen/authzen/grpc
 
 go 1.26
 
+// Minimum-supported language version is `go 1.26` above; this directive pins
+// the toolchain used to build/test to 1.26.2 (stdlib security fixes).
+toolchain go1.26.2
+
 // The gRPC binding lives in a nested module so that the gRPC and protobuf
 // dependencies never leak into the zero-dependency root module
 // (github.com/SCKelemen/authzen). The root module is consumed locally via the

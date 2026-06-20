@@ -3,6 +3,11 @@ name: CI
 # Build, vet, format-check, and test BOTH Go modules in this repository:
 #   - the zero-dependency root module  github.com/SCKelemen/authzen
 #   - the nested gRPC module           github.com/SCKelemen/authzen/grpc
+#
+# IMPORTANT: AUTHZEN_INTEROP_LIVE is intentionally NOT set anywhere in this
+# workflow. The opt-in live interop test (interop.TestLiveInterop) calls
+# t.Skip() unless AUTHZEN_INTEROP_LIVE=1, so leaving it unset keeps CI fully
+# offline and free of any network dependency.
 on:
   push:
     branches: ["**"]
@@ -19,7 +24,8 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Root module: github.com/SCKelemen/authzen (core + client/ + server/).
+  # Root module: github.com/SCKelemen/authzen (core '.', client/, server/,
+  # cmd/authzen, and the test-only interop/ conformance harness).
   # This is the format/vet gate AND the build/test gate for the root module.
   # ---------------------------------------------------------------------------
   root:
@@ -32,13 +38,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # Prefer go-version-file: setup-go reads the `go 1.26` directive from
-          # go.mod and resolves the matching toolchain. If go 1.26 is not yet
-          # available on GitHub-hosted runners, replace the next line with:
-          #   go-version: 'stable'
-          # ('stable' always resolves; Go's GOTOOLCHAIN=auto will still fetch
-          # the go.mod-required 1.26 toolchain on demand for build/test).
-          go-version-file: go.mod
+          # Pin the CI toolchain to Go 1.26.2. 1.26.0 ships stdlib advisories
+          # (crypto/x509, net/http, ...) that govulncheck flags as reachable;
+          # 1.26.2 carries their fixes. This `go-version` controls the actual
+          # toolchain CI builds and tests with; go.mod still declares the
+          # minimum-supported language version (`go 1.26`).
+          go-version: '1.26.2'
           # Root module has zero external dependencies (no go.sum), so key the
           # build cache off go.mod.
           cache-dependency-path: go.mod
@@ -56,25 +61,66 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # staticcheck is a HARD quality gate (a finding fails the build). It is
+      # installed via `go install` rather than a third-party action, consistent
+      # with this workflow's no-external-actions policy.
+      - name: staticcheck (quality gate)
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      # govulncheck RUNS AND REPORTS but does NOT gate the build
+      # (continue-on-error). The vulnerability database advances independently
+      # of our release cadence, so a newly published advisory should surface
+      # here for triage without spuriously breaking unrelated PRs. The toolchain
+      # pin above (Go 1.26.2) clears the stdlib advisories present in 1.26.0; the
+      # build gate is staticcheck + go vet + go test.
+      - name: govulncheck (report-only)
+        continue-on-error: true
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
       - name: go build
         run: go build ./...
 
-      - name: go test (race + coverage)
-        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+      # Full module test run. This SINGLE command already exercises ALL of:
+      #   - positive/negative core unit tests (root package '.')
+      #   - security/hardening tests in server/ and client/
+      #   - interop CONFORMANCE offline tests (vendored WG vectors, CI-safe)
+      # AUTHZEN_INTEROP_LIVE is unset, so interop.TestLiveInterop stays skipped.
+      - name: go test (full module ./..., race detector)
+        run: go test -race ./... -count=1
 
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out
+      - name: go test (coverage)
+        run: go test ./... -cover
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-root
-          path: coverage.out
-          if-no-files-found: error
+      # ---- Explicit, clearly-named category steps (for visibility) -----------
+      # These RE-RUN subsets that are ALREADY covered by the full './...' run
+      # above; they exist so the categories the team cares about surface as
+      # discrete, named CI steps (in addition to, not instead of, the full run).
+
+      # CONFORMANCE: interop offline vectors (vendored OpenID AuthZEN WG fixtures).
+      # AUTHZEN_INTEROP_LIVE remains unset -> TestLiveInterop is skipped here too.
+      - name: conformance (interop offline vectors)
+        run: go test ./interop/... -count=1 -v
+
+      # SECURITY / HARDENING: explicit security-focused tests in server/ + client/.
+      # Regex matches the real test names in server/hardening_test.go,
+      # server/server_test.go, client/transport_security_test.go and
+      # client/coverage_test.go (e.g. TestSameIssuerHardened, TestBearerToken*,
+      # TestRedirect*/TestStripSensitiveOnRedirect, TestRequestBodyTooLargeReturns413,
+      # TestResponseBodyLimited, TestAPIErrorBodyCapped, TestBatch*,
+      # TestPanicRecoveredReturns500, TestXRequestID*, TestSameIssuer,
+      # TestFallbackClientTimeout, TestVerboseErrorsEchoesDetail,
+      # TestServerErrorIsGeneric).
+      - name: security / hardening tests
+        run: go test ./server/... ./client/... -run "Hardening|Token|Redirect|Strip|RequestBody|ResponseBody|APIErrorBody|Batch|Recover|RequestID|SameIssuer|Timeout|VerboseErrors|ServerErrorIsGeneric" -count=1 -v
 
   # ---------------------------------------------------------------------------
   # Nested gRPC module: github.com/SCKelemen/authzen/grpc.
-  # Verifies the committed generated *.pb.go is up to date, then builds/tests.
+  # Separate go.mod with protobuf/gRPC deps. Format/vet/build/test gate, plus a
+  # best-effort `buf lint` that only runs when buf is available on PATH.
   # ---------------------------------------------------------------------------
   grpc:
     name: grpc module (buf, build, vet, test)
@@ -89,23 +135,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # See the note in the `root` job about go 1.26 vs. 'stable'.
-          go-version-file: grpc/go.mod
+          # Pin the CI toolchain to Go 1.26.2 for the stdlib security fixes (see
+          # the root job). go.mod still declares the minimum-supported `go 1.26`.
+          go-version: '1.26.2'
           cache-dependency-path: grpc/go.sum
-
-      - name: Set up buf
-        uses: bufbuild/buf-setup-action@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install protoc-gen-go plugins
-        # buf-setup-action installs buf only; buf generate needs the Go plugins
-        # on PATH. Versions are pinned to the ones that produced the committed
-        # stubs so `git diff --exit-code` below is deterministic.
-        run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: gofmt (fail on unformatted files)
         run: |
@@ -117,34 +150,50 @@ jobs:
           fi
           echo "gofmt: all files formatted"
 
-      - name: buf lint
-        run: buf lint
-
-      - name: buf generate (verify committed stubs are up to date)
-        run: buf generate
-
-      - name: Ensure generated code is committed
-        run: |
-          if ! git diff --exit-code; then
-            echo "::error::Generated code is out of date. Run 'make generate' in grpc/ and commit the result."
-            exit 1
-          fi
-
       - name: go vet
         run: go vet ./...
+
+      # HARD quality gate for the gRPC module (mirrors the root job).
+      - name: staticcheck (quality gate)
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      # Runs and reports; not a hard gate (see the root job's rationale).
+      - name: govulncheck (report-only)
+        continue-on-error: true
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
 
       - name: go build
         run: go build ./...
 
-      - name: go test (race + coverage)
-        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+      - name: go test (coverage, race detector)
+        run: go test -race ./... -count=1 -cover
 
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out
+      # Install buf and the protoc Go plugins via `go install` (not a
+      # third-party action, consistent with this workflow's policy) and put
+      # them on PATH for the lint and stub-drift gates below. buf resolves its
+      # module deps (googleapis) from buf.lock at run time.
+      - name: Install buf + protoc plugins
+        run: |
+          go install github.com/bufbuild/buf/cmd/buf@latest
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-grpc
-          path: grpc/coverage.out
-          if-no-files-found: error
+      # HARD gate: lint the proto sources (buf is now always installed).
+      - name: buf lint
+        run: buf lint
+
+      # HARD gate: the committed generated stubs under gen/ MUST match a fresh
+      # `buf generate`. `git add --intent-to-add` makes any newly generated
+      # (untracked) files visible to `git diff`, so additions as well as
+      # modifications fail the job. This is the stub-drift check the README
+      # advertises.
+      - name: proto stubs up to date (buf generate + git diff)
+        run: |
+          buf generate
+          git add --intent-to-add -- gen
+          git diff --exit-code -- gen
